@@ -15,6 +15,8 @@ class ProbeError(Exception):
 
 def read_stream(stream):
     data = []
+    text_parts = {}
+    completed_items = {}
     total = 0
     deadline = time.monotonic() + 180
     for raw in stream:
@@ -33,6 +35,16 @@ def read_stream(stream):
             if not isinstance(event, dict):
                 raise ProbeError('invalid_stream')
             kind = event.get('type')
+            if kind == 'response.output_item.done':
+                oi, item = event.get('output_index'), event.get('item')
+                if type(oi) is not int or not 0 <= oi < 4096 or not isinstance(item, dict):
+                    raise ProbeError('invalid_stream')
+                completed_items[oi] = item
+            if kind == 'response.output_text.delta':
+                oi, ci, delta = event.get('output_index', 0), event.get('content_index', 0), event.get('delta')
+                if type(oi) is not int or not 0 <= oi < 4096 or type(ci) is not int or not 0 <= ci < 128 or not isinstance(delta, str):
+                    raise ProbeError('invalid_stream')
+                text_parts.setdefault((oi, ci), []).append(delta)
             if kind in ('response.failed', 'response.incomplete', 'error'):
                 detail = event.get('response') or event
                 error = detail.get('error', {}) if isinstance(detail, dict) else {}
@@ -43,6 +55,14 @@ def read_stream(stream):
                 response = event.get('response')
                 if not isinstance(response, dict) or response.get('status') != 'completed':
                     raise ProbeError('invalid_completion')
+                if not response.get('output') and (text_parts or completed_items):
+                    messages = dict(completed_items)
+                    for (oi, ci), fragments in sorted(text_parts.items()):
+                        if oi in completed_items:
+                            continue  # Authoritative item snapshot already contains its text.
+                        item = messages.setdefault(oi, {'type': 'message', 'role': 'assistant', 'content': []})
+                        item['content'].append({'type': 'output_text', 'text': ''.join(fragments)})
+                    response = {**response, 'output': [messages[index] for index in sorted(messages)]}
                 return response
     raise ProbeError('stream_not_completed')
 

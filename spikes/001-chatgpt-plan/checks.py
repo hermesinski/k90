@@ -45,6 +45,44 @@ class StreamChecks(unittest.TestCase):
                 probe.read_stream(io.BytesIO(bad))
 
 
+class StreamAccumulationChecks(unittest.TestCase):
+    def test_text_from_deltas_survives_empty_completed_output(self):
+        probe = load_probe()
+        events = [
+            {'type': 'response.output_text.delta', 'output_index': 0, 'content_index': 0, 'delta': 'K90_SUBSCRIPTION_'},
+            {'type': 'response.output_text.delta', 'output_index': 0, 'content_index': 0, 'delta': 'OK'},
+            {'type': 'response.completed', 'response': {'status': 'completed', 'output': []}},
+        ]
+        wire = ''.join('data: '+json.dumps(e)+'\n\n' for e in events).encode()
+        self.assertEqual(probe.response_text(probe.read_stream(io.BytesIO(wire))), 'K90_SUBSCRIPTION_OK')
+        truncated = ''.join('data: '+json.dumps(e)+'\n\n' for e in events[:-1]).encode()
+        with self.assertRaises(probe.ProbeError):
+            probe.read_stream(io.BytesIO(truncated))
+
+
+    def test_completed_item_snapshots_preserve_tools_reasoning_and_do_not_duplicate_text(self):
+        probe = load_probe()
+        reasoning = {'type': 'reasoning', 'id': 'synthetic-reasoning', 'encrypted_content': 'synthetic-encrypted'}
+        call = {'type': 'function_call', 'namespace': 'k90_test', 'name': 'get_demo_meals',
+                'call_id': 'synthetic-call', 'arguments': '{}'}
+        message = {'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'OK'}]}
+        events = [
+            {'type': 'response.output_text.delta', 'output_index': 2, 'content_index': 0, 'delta': 'OK'},
+            {'type': 'response.output_item.done', 'output_index': 2, 'item': message},
+            {'type': 'response.output_item.done', 'output_index': 0, 'item': reasoning},
+            {'type': 'response.output_item.done', 'output_index': 1, 'item': call},
+            {'type': 'response.completed', 'response': {'status': 'completed', 'output': []}},
+        ]
+        wire = ''.join('data: '+json.dumps(e)+'\n\n' for e in events).encode()
+        result = probe.read_stream(io.BytesIO(wire))
+        self.assertEqual(result['output'], [reasoning, call, message])
+        self.assertEqual(probe.response_text(result), 'OK')
+        full = {'status': 'completed', 'output': [message]}
+        events[-1]['response'] = full
+        wire = ''.join('data: '+json.dumps(e)+'\n\n' for e in events).encode()
+        self.assertEqual(probe.read_stream(io.BytesIO(wire)), full)
+
+
 class CallbackChecks(unittest.TestCase):
     def test_callback_validates_path_state_duplicates_and_client(self):
         probe = load_probe()
@@ -101,6 +139,24 @@ class SmokeChecks(unittest.TestCase):
         self.assertIn('function_call_output', json.dumps(requests[2]))
         self.assertIn('data:image/png;base64,', json.dumps(requests[3]))
         self.assertEqual(requests[1]['tools'][0]['type'], 'namespace')
+
+
+    def test_all_smoke_checks_through_sparse_terminal_streams(self):
+        probe = load_probe()
+        answers = [
+            [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'K90_SUBSCRIPTION_OK'}]}],
+            [{'type': 'function_call', 'namespace': 'k90_test', 'name': 'get_demo_meals', 'call_id': 'synthetic', 'arguments': '{}'}],
+            [{'type': 'message', 'content': [{'type': 'output_text', 'text': '{"total_kcal":350}'}]}],
+            [{'type': 'message', 'content': [{'type': 'output_text', 'text': '{"left":"red circle","right":"blue square"}'}]}],
+        ]
+        def ask(payload):
+            items = answers.pop(0)
+            events = [{'type': 'response.output_item.done', 'output_index': i, 'item': item} for i, item in enumerate(items)]
+            events.append({'type': 'response.completed', 'response': {'status': 'completed', 'output': []}})
+            wire = ''.join('data: '+json.dumps(e)+'\n\n' for e in events).encode()
+            return probe.read_stream(io.BytesIO(wire))
+        self.assertEqual(probe.run_checks('demo-model', ask), {'text': 'PASS', 'tool': 'PASS', 'image': 'PASS'})
+        self.assertEqual(answers, [])
 
 
 class DiagnosticChecks(unittest.TestCase):
