@@ -10,6 +10,8 @@ API_ORIGIN = 'https://api.openai.com'
 class ProbeError(Exception):
     """An intentionally content-free diagnostic safe for a test report."""
 
+    diagnostics: dict[str, int | bool]
+
 
 def read_stream(stream):
     data = []
@@ -128,7 +130,25 @@ def run_checks(model, ask):
     import base64
     first = ask(build_payload(model, [{'role': 'user', 'content': 'Reply exactly K90_SUBSCRIPTION_OK and nothing else.'}]))
     if response_text(first) != 'K90_SUBSCRIPTION_OK':
-        raise ProbeError('text_output_mismatch')
+        # Report only counts and booleans, never model content or response IDs.
+        text = response_text(first)
+        items = first.get('output', [])
+        messages = [item for item in items if item.get('type') == 'message']
+        parts = [part for item in messages for part in item.get('content', [])]
+        error = ProbeError('text_output_mismatch')
+        error.diagnostics = {
+            'output_items': len(items),
+            'message_items': len(messages),
+            'reasoning_items': sum(item.get('type') == 'reasoning' for item in items),
+            'output_text_items': sum(part.get('type') == 'output_text' for part in parts),
+            'refusal_items': sum(part.get('type') == 'refusal' for part in parts),
+            'other_content_items': sum(part.get('type') not in ('output_text', 'refusal') for part in parts),
+            'extracted_text_characters': len(text),
+            'expected_marker_present': 'K90_SUBSCRIPTION_OK' in text,
+            'exact_match_ignoring_case': text.casefold() == 'k90_subscription_ok',
+            'top_level_output_text_present': isinstance(first.get('output_text'), str),
+        }
+        raise error
     print('TEXT: PASS', flush=True)
     tools = [{'type': 'namespace', 'name': 'k90_test', 'description': 'Read-only synthetic test data, not a real patient.', 'tools': [
         {'type': 'function', 'name': 'get_demo_meals', 'description': 'Read two fictional meals for an integration test.',
@@ -396,6 +416,8 @@ def main(argv=None):
     except Exception as exc:
         # Never print third-party exceptions: they can contain URLs or tokens.
         report['error'] = str(exc) if isinstance(exc, ProbeError) and re.fullmatch(r'[a-z0-9_]{1,100}', str(exc)) else type(exc).__name__
+        if isinstance(exc, ProbeError) and hasattr(exc, 'diagnostics'):
+            report['diagnostics'] = exc.diagnostics
         if hasattr(exc, 'renewable_session_revoked'):
             report['renewable_session_revoked'] = getattr(exc, 'renewable_session_revoked') is True
     finally:

@@ -103,6 +103,42 @@ class SmokeChecks(unittest.TestCase):
         self.assertEqual(requests[1]['tools'][0]['type'], 'namespace')
 
 
+class DiagnosticChecks(unittest.TestCase):
+    def test_text_mismatch_reports_structure_without_model_text_or_credentials(self):
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        probe = load_probe()
+        secret_text = 'synthetic-private@example.invalid K90_SUBSCRIPTION_OK.'
+        first = {'output': [{'type': 'reasoning'}, {'type': 'message', 'content': [
+            {'type': 'output_text', 'text': secret_text}]}]}
+        output = io.StringIO()
+        def request(url, **kwargs):
+            if url.endswith('/v1/models'):
+                return {'models': [{'visibility': 'list', 'slug': 'demo-model'}]}
+            return first
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch('pathlib.Path.home', return_value=Path(tmp)), \
+                patch.object(probe, 'authorize', return_value=({'access_token': 'synthetic-secret'}, 'oaiapp_demo')), \
+                patch.object(probe, 'request_json', side_effect=request), \
+                patch.object(probe, 'revoke', return_value=True), \
+                patch('builtins.input', side_effect=['demo-model', 't']), redirect_stdout(output):
+            self.assertEqual(probe.main([]), 1)
+            saved = (Path(tmp)/'.config/k90-subscription-probe/result.json').read_text()
+        report = json.loads(saved)
+        self.assertEqual(report['error'], 'text_output_mismatch')
+        self.assertEqual(report['diagnostics']['output_items'], 2)
+        self.assertEqual(report['diagnostics']['message_items'], 1)
+        self.assertEqual(report['diagnostics']['output_text_items'], 1)
+        self.assertEqual(report['diagnostics']['extracted_text_characters'], len(secret_text))
+        self.assertIs(report['diagnostics']['expected_marker_present'], True)
+        self.assertIs(report['diagnostics']['exact_match_ignoring_case'], False)
+        self.assertIs(report['renewable_session_revoked'], True)
+        self.assertNotIn(secret_text, saved + output.getvalue())
+        self.assertNotIn('synthetic-secret', saved + output.getvalue())
+        self.assertTrue(all(type(v) in (bool, int) for v in report['diagnostics'].values()))
+
+
 class AuthorizationChecks(unittest.TestCase):
     def test_real_loopback_callback_and_signature_checks_keep_tokens_out_of_files(self):
         probe = load_probe()
